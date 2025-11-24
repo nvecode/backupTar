@@ -1,0 +1,616 @@
+#!/bin/bash
+
+# Правильное присвоение параметров
+ACTION=$1
+case $ACTION in
+    "backup")
+        BACKUP_DIR=$2
+        BACKUP_NAME=$3
+        SOURCE_BACKUP=$4
+        BACKUP_FULL_COUNT=$5
+        BACKUP_INCR_COUNT=$6
+        ;;
+    "restore")
+        BACKUP_DIR=$2
+        RESTORE_DIR=$3
+        ;;
+    "list")
+        BACKUP_DIR=$2
+        SPECIFIC_BACKUP=$3
+        ;;
+esac
+
+# Обновленные пути с учетом backup_name
+BACKUP_DIR_DATA="${BACKUP_DIR}/data/${BACKUP_NAME}"
+BACKUP_DIR_DATA_LOG="${BACKUP_DIR}/logs/${BACKUP_NAME}"
+BACKUP_SNAR_DIR="${BACKUP_DIR}/snar/${BACKUP_NAME}"
+BACKUP_DATE=$(date +'%d%m%Y')
+BACKUP_TIME=$(date +'%H%M%S')
+BACKUP_FILENAME=${BACKUP_NAME}_${BACKUP_DATE}_${BACKUP_TIME}
+
+#Функция логирования
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+#Проверка директорий бэкап и логов
+ensure_directories() {
+    local dirs=("$BACKUP_DIR_DATA" "$BACKUP_DIR_DATA_LOG" "$BACKUP_SNAR_DIR")
+    for dir in "${dirs[@]}"; do
+        if [ ! -d "$dir" ]; then
+            mkdir -p "$dir"
+            log "Создана директория: $dir"
+        fi
+    done
+}
+
+#Функция вывода информации по скрипту
+show_help() {
+    cat << EOF
+Использование:
+  ./backupscript backup <backup_dir> <backup_name> <source_dir> <full_count> <incr_count>
+  ./backupscript restore <backup_dir> <restore_dir>
+  ./backupscript list <backup_dir> [backup_name]
+b
+Параметры для резервного копирования:
+  backup_dir    - директория для хранения бэкапов
+  backup_name   - имя бэкапа
+  source_dir    - директория для резервного копирования
+  full_count    - количество хранимых полных бэкапов (целое число)
+  incr_count    - количество хранимых инкрементальных бэкапов (целое число)
+
+Параметры для восстановления:
+  backup_dir    - директория для хранения бэкапов
+  restore_dir   - директория для восстановления
+
+Параметры для просмотра:
+  backup_dir    - директория для хранения бэкапов
+  backup_name   - (оптионально) имя бэкапа
+
+Примеры:
+  ./backupscript backup /backups mybackup /home/user 3 5
+  ./backupscript restore /backups /restored_data
+  ./backupscript list /backups
+  ./backupscript list /backups backup1
+EOF
+}
+
+# Функция проверки параметров для backup
+validate_backup_params() {
+    if [ -z "$BACKUP_DIR" ] || [ -z "$BACKUP_NAME" ] || [ -z "$SOURCE_BACKUP" ] || \
+       [ -z "$BACKUP_FULL_COUNT" ] || [ -z "$BACKUP_INCR_COUNT" ]; then
+        log "ОШИБКА: Не все параметры указаны"
+        return 1
+    fi
+
+    if [ ! -d "$SOURCE_BACKUP" ]; then
+        log "ОШИБКА: Исходная директория '$SOURCE_BACKUP' не существует"
+        return 1
+    fi
+
+    if ! [[ "$BACKUP_FULL_COUNT" =~ ^[0-9]+$ ]] || ! [[ "$BACKUP_INCR_COUNT" =~ ^[0-9]+$ ]]; then
+        log "ОШИБКА: Количество бэкапов должно быть целым числом"
+        return 1
+    fi
+
+    log "Параметры проверены:"
+    log "  BACKUP_DIR: $BACKUP_DIR"
+    log "  BACKUP_NAME: $BACKUP_NAME"
+    log "  SOURCE_BACKUP: $SOURCE_BACKUP"
+    log "  BACKUP_FULL_COUNT: $BACKUP_FULL_COUNT"
+    log "  BACKUP_INCR_COUNT: $BACKUP_INCR_COUNT"
+
+    return 0
+}
+
+# Функция проверки параметров для restore
+validate_restore_params() {
+    if [ -z "$BACKUP_DIR" ] || [ -z "$RESTORE_DIR" ]; then
+        log "ОШИБКА: Не все параметры указаны"
+        return 1
+    fi
+
+    if [ ! -d "$BACKUP_DIR" ]; then
+        log "ОШИБКА: Директория бэкапов '$BACKUP_DIR' не существует"
+        return 1
+    fi
+
+    return 0
+}
+
+# Функция получения списка backup_name
+get_backup_names() {
+    local backup_dir=$1
+    if [ ! -d "$backup_dir/data" ]; then
+        return 1
+    fi
+    find "$backup_dir/data" -maxdepth 1 -type d ! -path "$backup_dir/data" -exec basename {} \; | sort
+}
+
+#Функция поиска старых бэкапов или логов
+search_old_backup_or_log() {
+    local typeBackup=$1
+    local typeFile=$2
+    local file_count
+    local search_dir
+
+    if [ "$typeFile" == "backup" ]; then
+        search_dir=$BACKUP_DIR_DATA
+        file_count=$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep "$typeBackup" | wc -l)
+    elif [ "$typeFile" == "log" ]; then
+        search_dir=$BACKUP_DIR_DATA_LOG
+        file_count=$(ls "$BACKUP_DIR_DATA_LOG" 2>/dev/null | grep "$typeBackup" | wc -l)
+    elif [ "$typeFile" == "snar" ]; then
+        search_dir=$BACKUP_SNAR_DIR
+        file_count=$(ls "$BACKUP_SNAR_DIR" 2>/dev/null | grep "$typeBackup" | wc -l)
+    fi
+
+    if [ -n "$file_count" ]; then
+        if [ "$typeBackup" == "full" ]; then
+            if [ "$file_count" -gt "$BACKUP_FULL_COUNT" ]; then
+                find "$search_dir" -maxdepth 1 -type f -name '*full*' | sort -n | head -n 1
+            fi
+        elif [ "$typeBackup" == "incr" ]; then
+            if [ "$file_count" -gt "$BACKUP_INCR_COUNT" ]; then
+                find "$search_dir" -maxdepth 1 -type f -name '*incr*' | sort -n | head -n 1
+            fi
+        fi
+    fi
+}
+
+#Функция удаления инкрементных файлов
+remove_old_file_incr_or_log() {
+    local old_file_backup_or_log=$1
+    local folder_old_file_backup_or_log=$2
+
+    if [ -z "$old_file_backup_or_log" ] || [ ! -f "$old_file_backup_or_log" ]; then
+        return
+    fi
+
+    #Удаляем инкременты бэкапов или логов, созданные до времени старого полного бэкапа или файла лога
+    old_file_backup_or_log_date=$(echo "$old_file_backup_or_log" | awk -F'_' '{print $2}')
+    old_file_backup_or_log_time=$(echo "$old_file_backup_or_log" | awk -F'_' '{print $3}')
+    old_file_backup_or_log_full_date="${old_file_backup_or_log_date}${old_file_backup_or_log_time}"
+
+    for old_file in "$folder_old_file_backup_or_log"/*incr*; do
+        [ -f "$old_file" ] || continue
+        old_file_date=$(echo "$old_file" | awk -F'_' '{print $2}')
+        old_file_time=$(echo "$old_file" | awk -F'_' '{print $3}')
+        old_file_time_full_date="${old_file_date}${old_file_time}"
+
+        if [ "$old_file_time_full_date" -lt "$old_file_backup_or_log_full_date" ]; then
+            rm -f "$old_file"
+            log "Удален старый файл: $(basename "$old_file")"
+        fi
+    done
+}
+
+#Функция создания инкрементных копий
+backup_increment() {
+    if [ "$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep -c full)" -gt 0 ]; then
+        #Проверка наличия последнего snar файла
+        if [ -f "$BACKUP_SNAR_DIR/last_backup.snar" ]; then
+            BACKUP_SNAR=$(cat "$BACKUP_SNAR_DIR/last_backup.snar")
+        else
+            log "Файл SNAR для последнего запущенного полного бэкапа не найден"
+            exit 1
+        fi
+
+        #Выполнение инкрементного бэкапа
+        log "Создание инкрементного бэкапа..."
+        tar -g "$BACKUP_SNAR" -czf "$BACKUP_DIR_DATA/${BACKUP_FILENAME}_incr.tar.gz" -C "$SOURCE_BACKUP" . > "$BACKUP_DIR_DATA_LOG/${BACKUP_FILENAME}_incr.log" 2>&1
+
+        if [ $? -eq 0 ]; then
+            log "Инкрементный бэкап создан: ${BACKUP_FILENAME}_incr.tar.gz"
+
+            #Находим бэкап или файлы, старше нужных POINT
+            old_file_backup_incr=$(search_old_backup_or_log incr backup)
+            old_file_log_backup_incr=$(search_old_backup_or_log incr log)
+
+            #Удаляем найденные файлы бэкап или логов
+            if [ -n "$old_file_backup_incr" ]; then
+                rm -f "$old_file_backup_incr"
+                log "Удален старый инкрементный бэкап: $(basename "$old_file_backup_incr")"
+            fi
+            if [ -n "$old_file_log_backup_incr" ]; then
+                rm -f "$old_file_log_backup_incr"
+                log "Удален старый лог: $(basename "$old_file_log_backup_incr")"
+            fi
+        else
+            log "ОШИБКА: Не удалось создать инкрементный бэкап"
+            exit 1
+        fi
+    else
+        log "Необходимо сначала выполнить полный бэкап"
+        exit 1
+    fi
+}
+
+#Функция создания полных копий
+backup_full() {
+    BACKUP_SNAR="$BACKUP_SNAR_DIR/${BACKUP_NAME}_${BACKUP_DATE}_${BACKUP_TIME}_full.snar"
+    echo "$BACKUP_SNAR" > "$BACKUP_SNAR_DIR/last_backup.snar"
+
+    #Выполнение полного бэкапа
+    log "Создание полного бэкапа..."
+    tar -g "$BACKUP_SNAR" -czf "$BACKUP_DIR_DATA/${BACKUP_FILENAME}_full.tar.gz" -C "$SOURCE_BACKUP" . > "$BACKUP_DIR_DATA_LOG/${BACKUP_FILENAME}_full.log" 2>&1
+
+    if [ $? -eq 0 ]; then
+        log "Полный бэкап создан: ${BACKUP_FILENAME}_full.tar.gz"
+
+        #Находим бэкап или файлы, старше нужных POINT
+        old_file_backup_full=$(search_old_backup_or_log full backup)
+        old_file_log_backup_full=$(search_old_backup_or_log full log)
+        old_file_snar_backup_full=$(search_old_backup_or_log full snar)
+
+        #Удаляем найденные файлы бэкап или логов
+        if [ -n "$old_file_backup_full" ]; then
+            rm -f "$old_file_backup_full"
+            log "Удален старый полный бэкап: $(basename "$old_file_backup_full")"
+        fi
+        if [ -n "$old_file_log_backup_full" ]; then
+            rm -f "$old_file_log_backup_full"
+            log "Удален старый лог: $(basename "$old_file_log_backup_full")"
+        fi
+        if [ -n "$old_file_snar_backup_full" ]; then
+            rm -f "$old_file_snar_backup_full"
+            log "Удален старый snar-файл: $(basename "$old_file_snar_backup_full")"
+        fi
+
+        #Проверка наличия двух полных бэкапов и удаление всех инкрементов не актуальных для этих полных бэкапов
+        count_full_backup=$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep -c full)
+        if [ "$count_full_backup" -eq "$BACKUP_FULL_COUNT" ]; then
+            old_file_backup_full=$(find "$BACKUP_DIR_DATA" -maxdepth 1 -type f -name '*full*' | sort -n | head -n 1)
+            old_file_log_backup_full=$(find "$BACKUP_DIR_DATA_LOG" -maxdepth 1 -type f -name '*full*' | sort -n | head -n 1)
+            remove_old_file_incr_or_log "$old_file_backup_full" "$BACKUP_DIR_DATA"
+            remove_old_file_incr_or_log "$old_file_log_backup_full" "$BACKUP_DIR_DATA_LOG"
+        fi
+    else
+        log "ОШИБКА: Не удалось создать полный бэкап"
+        exit 1
+    fi
+}
+
+# Функция просмотра содержимого бэкапа
+list_backup_contents() {
+    if [ -z "$BACKUP_DIR" ] || [ ! -d "$BACKUP_DIR" ]; then
+        log "ОШИБКА: Директория бэкапов '$BACKUP_DIR' не существует"
+        return 1
+    fi
+
+    # Получаем список всех backup_name
+    local backup_names=$(get_backup_names "$BACKUP_DIR")
+
+    if [ -z "$backup_names" ]; then
+        log "В директории '$BACKUP_DIR' не найдено бэкапов"
+        return 1
+    fi
+
+    # Если указано конкретное имя бэкапа
+    if [ -n "$SPECIFIC_BACKUP" ]; then
+        if echo "$backup_names" | grep -q "^$SPECIFIC_BACKUP$"; then
+            show_backup_files "$SPECIFIC_BACKUP"
+        else
+            log "ОШИБКА: Бэкап с именем '$SPECIFIC_BACKUP' не найден"
+            log "Доступные бэкапы:"
+            echo "$backup_names"
+            return 1
+        fi
+        return 0
+    fi
+
+    # Показать список всех backup_name
+    log "Доступные имена бэкапов:"
+    echo "=========================================="
+    local i=1
+    while IFS= read -r backup_name; do
+        local backup_count=$(find "$BACKUP_DIR/data/$backup_name" -maxdepth 1 -name "*.tar.gz" 2>/dev/null | wc -l)
+        local last_backup=$(find "$BACKUP_DIR/data/$backup_name" -maxdepth 1 -name "*.tar.gz" -exec stat -c %Y {} \; 2>/dev/null | sort -nr | head -1)
+        local last_backup_date=""
+        if [ -n "$last_backup" ]; then
+            last_backup_date=$(date -d "@$last_backup" "+%Y-%m-%d %H:%M:%S")
+        fi
+        echo "$i) $backup_name (файлов: $backup_count, последний: $last_backup_date)"
+        ((i++))
+    done <<< "$backup_names"
+    echo "=========================================="
+
+    # Предложить выбрать бэкап для просмотра файлов
+    echo ""
+    read -p "Введите номер бэкапа для просмотра файлов (или Enter для выхода): " selection
+
+    if [ -n "$selection" ] && [[ "$selection" =~ ^[0-9]+$ ]]; then
+        local selected_backup_name=$(echo "$backup_names" | sed -n "${selection}p")
+        if [ -n "$selected_backup_name" ]; then
+            show_backup_files "$selected_backup_name"
+        else
+            log "ОШИБКА: Неверный номер бэкапа"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Функция показа файлов конкретного бэкапа
+show_backup_files() {
+    local backup_name=$1
+    local backup_path="$BACKUP_DIR/data/$backup_name"
+
+    log "Файлы бэкапа: $backup_name"
+    echo "=========================================="
+
+    # Получаем список файлов бэкапа с информацией
+    local backup_files=$(find "$backup_path" -maxdepth 1 -type f -name "*.tar.gz" | sort)
+
+    if [ -z "$backup_files" ]; then
+        log "В бэкапе '$backup_name' не найдено файлов"
+        return 1
+    fi
+
+    local i=1
+    while IFS= read -r backup_file; do
+        local file_name=$(basename "$backup_file")
+        local file_size=$(du -h "$backup_file" | cut -f1)
+        local file_date=$(stat -c %y "$backup_file" 2>/dev/null | cut -d'.' -f1)
+        local file_type=""
+
+        if [[ "$file_name" == *"_full"* ]]; then
+            file_type="[FULL]"
+        elif [[ "$file_name" == *"_incr"* ]]; then
+            file_type="[INCR]"
+        fi
+
+        echo "$i) $file_type $file_name ($file_size, изменен: $file_date)"
+        ((i++))
+    done <<< "$backup_files"
+    echo "=========================================="
+
+    # Предложить выбрать конкретный файл для просмотра содержимого
+    echo ""
+    read -p "Введите номер файла для просмотра содержимого (или Enter для возврата): " file_selection
+
+    if [ -n "$file_selection" ] && [[ "$file_selection" =~ ^[0-9]+$ ]]; then
+        local selected_file=$(echo "$backup_files" | sed -n "${file_selection}p")
+        if [ -n "$selected_file" ]; then
+            echo ""
+            log "Содержимое файла: $(basename "$selected_file")"
+            echo "=========================================="
+            if tar -tzf "$selected_file" > /dev/null 2>&1; then
+                tar -tzf "$selected_file" | sort
+                echo "=========================================="
+                log "Всего файлов в архиве: $(tar -tzf "$selected_file" | wc -l)"
+            else
+                log "ОШИБКА: Не удалось прочитать содержимое архива"
+            fi
+        else
+            log "ОШИБКА: Неверный номер файла"
+        fi
+    fi
+}
+
+#Функция восстановления файлов
+restore_data() {
+    # Получаем список backup_name для выбора
+    local backup_names=$(get_backup_names "$BACKUP_DIR")
+
+    if [ -z "$backup_names" ]; then
+        log "Нет доступных бэкапов"
+        exit 1
+    fi
+
+    log "Доступные бэкапы:"
+    echo "=========================================="
+    local i=1
+    while IFS= read -r backup_name; do
+        echo "$i) $backup_name"
+        ((i++))
+    done <<< "$backup_names"
+    echo "=========================================="
+
+    read -p "Выберите номер бэкапа для восстановления: " backup_selection
+
+    if [ -z "$backup_selection" ] || ! [[ "$backup_selection" =~ ^[0-9]+$ ]]; then
+        log "ОШИБКА: Неверный выбор"
+        exit 1
+    fi
+
+    local selected_backup_name=$(echo "$backup_names" | sed -n "${backup_selection}p")
+    if [ -z "$selected_backup_name" ]; then
+        log "ОШИБКА: Неверный номер бэкапа"
+        exit 1
+    fi
+
+    # Обновляем пути для выбранного бэкапа
+    local BACKUP_DIR_DATA_RESTORE="${BACKUP_DIR}/data/${selected_backup_name}"
+
+    #Показать доступные файлы бэкапа
+    local backup_files=$(ls -1 "$BACKUP_DIR_DATA_RESTORE"/*.tar.gz 2>/dev/null | sort)
+
+    if [ -z "$backup_files" ]; then
+        log "В бэкапе '$selected_backup_name' нет файлов"
+        exit 1
+    fi
+
+    log "Доступные файлы бэкапа '$selected_backup_name':"
+    local i=1
+    local file_list=()
+    while IFS= read -r backup_file; do
+        echo "$i) $(basename "$backup_file")"
+        file_list[$i]="$backup_file"
+        ((i++))
+    done <<< "$backup_files"
+
+    # Упрощенный выбор файла для восстановления
+    echo ""
+    read -p "Выберите номер файла для восстановления (или Enter для использования всех файлов): " file_selection
+
+    local selected_files=()
+    if [ -n "$file_selection" ] && [[ "$file_selection" =~ ^[0-9]+$ ]]; then
+        if [ -n "${file_list[$file_selection]}" ]; then
+            selected_files=("${file_list[$file_selection]}")
+            log "Выбран файл: $(basename "${selected_files[0]}")"
+        else
+            log "ОШИБКА: Неверный номер файла"
+            exit 1
+        fi
+    else
+        # Используем все файлы
+        selected_files=($backup_files)
+        log "Используются все файлы бэкапа"
+    fi
+
+    echo ""
+    log "Доступные пути в бэкапе (первые 20):"
+    tar -tf "${selected_files[0]}" | head -20
+    echo ""
+
+    read -p "Введите точный путь к файлу или папке для восстановления: " restore_path
+
+    if [ -z "$restore_path" ]; then
+        log "ОШИБКА: Путь для восстановления не указан"
+        exit 1
+    fi
+
+    # Создаем директорию восстановления если не существует
+    if [ ! -d "$RESTORE_DIR" ]; then
+        mkdir -p "$RESTORE_DIR"
+        log "Создана директория восстановления: $RESTORE_DIR"
+    fi
+
+    log "Начинаем восстановление..."
+    local found_files=0
+
+    # Восстанавливаем из каждого выбранного файла
+    for backup_file in "${selected_files[@]}"; do
+        if [ ! -f "$backup_file" ]; then
+            continue
+        fi
+
+        log "Поиск в файле: $(basename "$backup_file")"
+
+        # Получаем список всех файлов в архиве
+        local all_files=$(tar -tf "$backup_file" 2>/dev/null)
+
+        # Ищем файлы, соответствующие пути
+        local files_to_restore=""
+        if [[ "$restore_path" == */ ]]; then
+            # Если путь заканчивается на /, ищем папку и её содержимое
+            files_to_restore=$(echo "$all_files" | grep -E "^${restore_path}|^\./${restore_path}")
+        else
+            # Ищем точное совпадение или начинающееся с пути
+            files_to_restore=$(echo "$all_files" | grep -E "^${restore_path}(/|$)|^\./${restore_path}(/|$)")
+        fi
+
+        if [ -n "$files_to_restore" ]; then
+            log "Найдены файлы в $(basename "$backup_file"):"
+            echo "$files_to_restore"
+
+            # Восстанавливаем найденные файлы
+            while IFS= read -r file_in_backup; do
+                if [ -n "$file_in_backup" ]; then
+                    log "Восстанавливаем: $file_in_backup"
+
+                    # Извлекаем файл/папку
+                    if tar -xf "$backup_file" -C "$RESTORE_DIR" "$file_in_backup" 2>/dev/null; then
+                        log "Успешно восстановлен: $file_in_backup"
+                        ((found_files++))
+                    else
+                        log "ОШИБКА: Не удалось восстановить $file_in_backup"
+                    fi
+                fi
+            done <<< "$files_to_restore"
+        else
+            log "Файлы по пути '$restore_path' не найдены в $(basename "$backup_file")"
+        fi
+    done
+
+    if [ "$found_files" -gt 0 ]; then
+        log "Восстановление завершено. Найдено и восстановлено файлов/папок: $found_files"
+        log "Восстановленные файлы находятся в: $RESTORE_DIR"
+
+        # Показываем что восстановлено
+        log "Содержимое восстановленной папки:"
+        find "$RESTORE_DIR" -type f | head -10
+        if [ $(find "$RESTORE_DIR" -type f | wc -l) -gt 10 ]; then
+            log "... и другие файлы"
+        fi
+    else
+        log "Файлы для восстановления не найдены"
+        log "Попробуйте следующие варианты:"
+        log "  'admin/' - для папки admin и её содержимого"
+        log "  './admin/' - для папки admin из корня бэкапа"
+        log "  'admin' - для поиска любых вхождений 'admin'"
+    fi
+}
+
+case $ACTION in
+    "backup")
+        log "Режим: Резервное копирование"
+
+        # Проверка параметров
+        if ! validate_backup_params; then
+            log "ОШИБКА: Неверные параметры для резервного копирования"
+            show_help
+            exit 1
+        fi
+
+        ensure_directories
+
+        # Автоматическое определение типа бэкапа
+        if [ "$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep -c full)" -eq 0 ]; then
+            log "Первый бэкап - создание полного бэкапа"
+            backup_full
+        else
+            # Проверяем когда был последний полный бэкап
+            last_full_backup=$(find "$BACKUP_DIR_DATA" -name "*_full.tar.gz" -type f | sort -r | head -1)
+            if [ -n "$last_full_backup" ]; then
+                # Простая логика: если прошло больше 7 дней с последнего полного бэкапа, делаем полный
+                last_full_date=$(stat -c %Y "$last_full_backup" 2>/dev/null)
+                current_date=$(date +%s)
+                days_diff=$(( (current_date - last_full_date) / 86400 ))
+
+                if [ "$days_diff" -ge 7 ]; then
+                    log "Прошло $days_diff дней с последнего полного бэкапа - создание полного бэкапа"
+                    backup_full
+                else
+                    log "Создание инкрементного бэкапа"
+                    backup_increment
+                fi
+            else
+                log "Создание полного бэкапа"
+                backup_full
+            fi
+        fi
+        ;;
+
+    "restore")
+        log "Режим: Восстановление"
+
+        # Проверка параметров
+        if ! validate_restore_params; then
+            log "ОШИБКА: Неверные параметры для восстановления"
+            show_help
+            exit 1
+        fi
+
+        # Создание директории восстановления если не существует
+        if [ ! -d "$RESTORE_DIR" ]; then
+            mkdir -p "$RESTORE_DIR"
+            log "Создана директория восстановления: $RESTORE_DIR"
+        fi
+
+        restore_data
+        ;;
+
+    "list")
+        log "Режим: Просмотр бэкапов"
+        list_backup_contents
+        ;;
+
+    *)
+        log "ОШИБКА: Неизвестная команда '$ACTION'"
+        show_help
+        exit 1
+        ;;
+esac
