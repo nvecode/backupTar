@@ -4,11 +4,12 @@
 ACTION=$1
 case $ACTION in
     "backup")
-        BACKUP_DIR=$2
-        BACKUP_NAME=$3
-        SOURCE_BACKUP=$4
-        BACKUP_FULL_COUNT=$5
-        BACKUP_INCR_COUNT=$6
+        BACKUP_TYPE=$2  # Добавляем параметр типа бэкапа: full или incr
+        BACKUP_DIR=$3
+        BACKUP_NAME=$4
+        SOURCE_BACKUP=$5
+        BACKUP_FULL_COUNT=$6
+        BACKUP_INCR_COUNT=$7
         ;;
     "restore")
         BACKUP_DIR=$2
@@ -48,11 +49,12 @@ ensure_directories() {
 show_help() {
     cat << EOF
 Использование:
-  ./backupscript backup <backup_dir> <backup_name> <source_dir> <full_count> <incr_count>
+  ./backupscript backup <backup_type> <backup_dir> <backup_name> <source_dir> <full_count> <incr_count>
   ./backupscript restore <backup_dir> <restore_dir>
   ./backupscript list <backup_dir> [backup_name]
-b
+
 Параметры для резервного копирования:
+  backup_type   - тип бэкапа: full (полный) или incr (инкрементальный)
   backup_dir    - директория для хранения бэкапов
   backup_name   - имя бэкапа
   source_dir    - директория для резервного копирования
@@ -65,10 +67,11 @@ b
 
 Параметры для просмотра:
   backup_dir    - директория для хранения бэкапов
-  backup_name   - (оптионально) имя бэкапа
+  backup_name   - (опционально) имя бэкапа
 
 Примеры:
-  ./backupscript backup /backups mybackup /home/user 3 5
+  ./backupscript backup full /backups mybackup /home/user 3 5
+  ./backupscript backup incr /backups mybackup /home/user 3 5
   ./backupscript restore /backups /restored_data
   ./backupscript list /backups
   ./backupscript list /backups backup1
@@ -77,9 +80,14 @@ EOF
 
 # Функция проверки параметров для backup
 validate_backup_params() {
-    if [ -z "$BACKUP_DIR" ] || [ -z "$BACKUP_NAME" ] || [ -z "$SOURCE_BACKUP" ] || \
+    if [ -z "$BACKUP_TYPE" ] || [ -z "$BACKUP_DIR" ] || [ -z "$BACKUP_NAME" ] || [ -z "$SOURCE_BACKUP" ] || \
        [ -z "$BACKUP_FULL_COUNT" ] || [ -z "$BACKUP_INCR_COUNT" ]; then
         log "ОШИБКА: Не все параметры указаны"
+        return 1
+    fi
+
+    if [ "$BACKUP_TYPE" != "full" ] && [ "$BACKUP_TYPE" != "incr" ]; then
+        log "ОШИБКА: Неверный тип бэкапа. Используйте 'full' или 'incr'"
         return 1
     fi
 
@@ -94,6 +102,7 @@ validate_backup_params() {
     fi
 
     log "Параметры проверены:"
+    log "  BACKUP_TYPE: $BACKUP_TYPE"
     log "  BACKUP_DIR: $BACKUP_DIR"
     log "  BACKUP_NAME: $BACKUP_NAME"
     log "  SOURCE_BACKUP: $SOURCE_BACKUP"
@@ -136,24 +145,34 @@ search_old_backup_or_log() {
 
     if [ "$typeFile" == "backup" ]; then
         search_dir=$BACKUP_DIR_DATA
-        file_count=$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep "$typeBackup" | wc -l)
     elif [ "$typeFile" == "log" ]; then
         search_dir=$BACKUP_DIR_DATA_LOG
-        file_count=$(ls "$BACKUP_DIR_DATA_LOG" 2>/dev/null | grep "$typeBackup" | wc -l)
     elif [ "$typeFile" == "snar" ]; then
         search_dir=$BACKUP_SNAR_DIR
-        file_count=$(ls "$BACKUP_SNAR_DIR" 2>/dev/null | grep "$typeBackup" | wc -l)
     fi
 
-    if [ -n "$file_count" ]; then
-        if [ "$typeBackup" == "full" ]; then
-            if [ "$file_count" -gt "$BACKUP_FULL_COUNT" ]; then
-                find "$search_dir" -maxdepth 1 -type f -name '*full*' | sort -n | head -n 1
+    # Получаем список файлов без учета только что созданного
+    local files=()
+    if [ -d "$search_dir" ]; then
+        while IFS= read -r -d '' file; do
+            # Исключаем текущий создаваемый файл из проверки
+            if [[ "$(basename "$file")" != "${BACKUP_FILENAME}_${typeBackup}"* ]]; then
+                files+=("$file")
             fi
-        elif [ "$typeBackup" == "incr" ]; then
-            if [ "$file_count" -gt "$BACKUP_INCR_COUNT" ]; then
-                find "$search_dir" -maxdepth 1 -type f -name '*incr*' | sort -n | head -n 1
-            fi
+        done < <(find "$search_dir" -maxdepth 1 -type f -name "*${typeBackup}*" -print0 2>/dev/null)
+    fi
+
+    file_count=${#files[@]}
+
+    if [ "$typeBackup" == "full" ]; then
+        if [ "$file_count" -ge "$BACKUP_FULL_COUNT" ]; then
+            # Сортируем по дате и выбираем самый старый
+            printf '%s\0' "${files[@]}" | xargs -0 ls -tr 2>/dev/null | head -n 1
+        fi
+    elif [ "$typeBackup" == "incr" ]; then
+        if [ "$file_count" -ge "$BACKUP_INCR_COUNT" ]; then
+            # Сортируем по дате и выбираем самый старый
+            printf '%s\0' "${files[@]}" | xargs -0 ls -tr 2>/dev/null | head -n 1
         fi
     fi
 }
@@ -167,47 +186,67 @@ remove_old_file_incr_or_log() {
         return
     fi
 
-    #Удаляем инкременты бэкапов или логов, созданные до времени старого полного бэкапа или файла лога
-    old_file_backup_or_log_date=$(echo "$old_file_backup_or_log" | awk -F'_' '{print $2}')
-    old_file_backup_or_log_time=$(echo "$old_file_backup_or_log" | awk -F'_' '{print $3}')
-    old_file_backup_or_log_full_date="${old_file_backup_or_log_date}${old_file_backup_or_log_time}"
+    log "Удаление инкрементных файлов, связанных с: $(basename "$old_file_backup_or_log")"
+    
+    # Получаем дату из имени файла
+    local old_file_basename=$(basename "$old_file_backup_or_log")
+    local old_file_date=$(echo "$old_file_basename" | awk -F'_' '{print $2}')
+    
+    if [ -z "$old_file_date" ]; then
+        log "Не удалось извлечь дату из имени файла: $old_file_basename"
+        return
+    fi
 
+    # Удаляем все инкрементные файлы, созданные до этой даты
+    local deleted_count=0
     for old_file in "$folder_old_file_backup_or_log"/*incr*; do
         [ -f "$old_file" ] || continue
-        old_file_date=$(echo "$old_file" | awk -F'_' '{print $2}')
-        old_file_time=$(echo "$old_file" | awk -F'_' '{print $3}')
-        old_file_time_full_date="${old_file_date}${old_file_time}"
-
-        if [ "$old_file_time_full_date" -lt "$old_file_backup_or_log_full_date" ]; then
+        local old_file_basename_incr=$(basename "$old_file")
+        local old_file_date_incr=$(echo "$old_file_basename_incr" | awk -F'_' '{print $2}')
+        
+        if [ -n "$old_file_date_incr" ] && [ "$old_file_date_incr" -lt "$old_file_date" ]; then
             rm -f "$old_file"
             log "Удален старый файл: $(basename "$old_file")"
+            ((deleted_count++))
         fi
     done
+    
+    if [ "$deleted_count" -eq 0 ]; then
+        log "Инкрементные файлы для удаления не найдены"
+    fi
 }
 
 #Функция создания инкрементных копий
 backup_increment() {
+    # Проверка наличия полного бэкапа
     if [ "$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep -c full)" -gt 0 ]; then
-        #Проверка наличия последнего snar файла
+        # Проверка наличия последнего snar файла
         if [ -f "$BACKUP_SNAR_DIR/last_backup.snar" ]; then
             BACKUP_SNAR=$(cat "$BACKUP_SNAR_DIR/last_backup.snar")
         else
-            log "Файл SNAR для последнего запущенного полного бэкапа не найден"
-            exit 1
+            # Ищем последний snar файл полного бэкапа
+            local last_full_snar=$(find "$BACKUP_SNAR_DIR" -name "*_full.snar" | sort -r | head -1)
+            if [ -n "$last_full_snar" ]; then
+                BACKUP_SNAR="$last_full_snar"
+                echo "$BACKUP_SNAR" > "$BACKUP_SNAR_DIR/last_backup.snar"
+            else
+                log "ОШИБКА: Не найден snar файл для полного бэкапа"
+                exit 1
+            fi
         fi
 
-        #Выполнение инкрементного бэкапа
+        # Выполнение инкрементного бэкапа
         log "Создание инкрементного бэкапа..."
         tar -g "$BACKUP_SNAR" -czf "$BACKUP_DIR_DATA/${BACKUP_FILENAME}_incr.tar.gz" -C "$SOURCE_BACKUP" . > "$BACKUP_DIR_DATA_LOG/${BACKUP_FILENAME}_incr.log" 2>&1
 
         if [ $? -eq 0 ]; then
             log "Инкрементный бэкап создан: ${BACKUP_FILENAME}_incr.tar.gz"
 
-            #Находим бэкап или файлы, старше нужных POINT
+            # Находим бэкап или файлы, старше нужных POINT
             old_file_backup_incr=$(search_old_backup_or_log incr backup)
             old_file_log_backup_incr=$(search_old_backup_or_log incr log)
 
-            #Удаляем найденные файлы бэкап или логов
+            # Удаляем найденные файлы бэкап или логов
             if [ -n "$old_file_backup_incr" ]; then
                 rm -f "$old_file_backup_incr"
                 log "Удален старый инкрементный бэкап: $(basename "$old_file_backup_incr")"
@@ -221,7 +260,7 @@ backup_increment() {
             exit 1
         fi
     else
-        log "Необходимо сначала выполнить полный бэкап"
+        log "ОШИБКА: Не найден полный бэкап. Сначала выполните полный бэкап."
         exit 1
     fi
 }
@@ -231,39 +270,75 @@ backup_full() {
     BACKUP_SNAR="$BACKUP_SNAR_DIR/${BACKUP_NAME}_${BACKUP_DATE}_${BACKUP_TIME}_full.snar"
     echo "$BACKUP_SNAR" > "$BACKUP_SNAR_DIR/last_backup.snar"
 
-    #Выполнение полного бэкапа
+    # Выполнение полного бэкапа
     log "Создание полного бэкапа..."
     tar -g "$BACKUP_SNAR" -czf "$BACKUP_DIR_DATA/${BACKUP_FILENAME}_full.tar.gz" -C "$SOURCE_BACKUP" . > "$BACKUP_DIR_DATA_LOG/${BACKUP_FILENAME}_full.log" 2>&1
 
     if [ $? -eq 0 ]; then
         log "Полный бэкап создан: ${BACKUP_FILENAME}_full.tar.gz"
 
-        #Находим бэкап или файлы, старше нужных POINT
-        old_file_backup_full=$(search_old_backup_or_log full backup)
-        old_file_log_backup_full=$(search_old_backup_or_log full log)
-        old_file_snar_backup_full=$(search_old_backup_or_log full snar)
+        # Даем время на запись файла
+        sleep 2
 
-        #Удаляем найденные файлы бэкап или логов
-        if [ -n "$old_file_backup_full" ]; then
-            rm -f "$old_file_backup_full"
-            log "Удален старый полный бэкап: $(basename "$old_file_backup_full")"
-        fi
-        if [ -n "$old_file_log_backup_full" ]; then
-            rm -f "$old_file_log_backup_full"
-            log "Удален старый лог: $(basename "$old_file_log_backup_full")"
-        fi
-        if [ -n "$old_file_snar_backup_full" ]; then
-            rm -f "$old_file_snar_backup_full"
-            log "Удален старый snar-файл: $(basename "$old_file_snar_backup_full")"
-        fi
-
-        #Проверка наличия двух полных бэкапов и удаление всех инкрементов не актуальных для этих полных бэкапов
-        count_full_backup=$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep -c full)
-        if [ "$count_full_backup" -eq "$BACKUP_FULL_COUNT" ]; then
-            old_file_backup_full=$(find "$BACKUP_DIR_DATA" -maxdepth 1 -type f -name '*full*' | sort -n | head -n 1)
-            old_file_log_backup_full=$(find "$BACKUP_DIR_DATA_LOG" -maxdepth 1 -type f -name '*full*' | sort -n | head -n 1)
-            remove_old_file_incr_or_log "$old_file_backup_full" "$BACKUP_DIR_DATA"
-            remove_old_file_incr_or_log "$old_file_log_backup_full" "$BACKUP_DIR_DATA_LOG"
+        # Находим и удаляем старый полный бэкап и все связанные с ним файлы
+        local old_full_backup=$(find "$BACKUP_DIR_DATA" -maxdepth 1 -type f -name '*full*' ! -name "${BACKUP_FILENAME}_full.tar.gz" | sort -n | head -n 1)
+        
+        if [ -n "$old_full_backup" ] && [ -f "$old_full_backup" ]; then
+            # Получаем базовое имя старого полного бэкапа
+            local old_backup_basename=$(basename "$old_full_backup" .tar.gz)
+            local old_backup_date=$(echo "$old_backup_basename" | awk -F'_' '{print $2}')
+            
+            log "Найден старый полный бэкап: $(basename "$old_full_backup")"
+            
+            # 1. Удаляем старый полный бэкап
+            rm -f "$old_full_backup"
+            log "Удален старый полный бэкап: $(basename "$old_full_backup")"
+            
+            # 2. Удаляем лог старого полного бэкапа
+            local old_log="${BACKUP_DIR_DATA_LOG}/${old_backup_basename}.log"
+            if [ -f "$old_log" ]; then
+                rm -f "$old_log"
+                log "Удален старый лог: $(basename "$old_log")"
+            fi
+            
+            # 3. Удаляем snar файл старого полного бэкапа
+            local old_snar="${BACKUP_SNAR_DIR}/${old_backup_basename}.snar"
+            if [ -f "$old_snar" ]; then
+                rm -f "$old_snar"
+                log "Удален старый snar-файл: $(basename "$old_snar")"
+            fi
+            
+            # 4. Удаляем ВСЕ инкрементные бэкапы, созданные до нового полного бэкапа
+            log "Удаление старых инкрементных бэкапов..."
+            local deleted_count=0
+            for incr_file in "$BACKUP_DIR_DATA"/*incr*.tar.gz; do
+                [ -f "$incr_file" ] || continue
+                local incr_basename=$(basename "$incr_file")
+                local incr_date=$(echo "$incr_basename" | awk -F'_' '{print $2}')
+                
+                # Сравниваем даты (формат DDMMYYYY)
+                if [ "$incr_date" -lt "$BACKUP_DATE" ]; then
+                    rm -f "$incr_file"
+                    
+                    # Удаляем соответствующий лог
+                    local incr_log_file="${BACKUP_DIR_DATA_LOG}/${incr_basename%.tar.gz}.log"
+                    if [ -f "$incr_log_file" ]; then
+                        rm -f "$incr_log_file"
+                        log "Удален лог инкрементного бэкапа: $(basename "$incr_log_file")"
+                    fi
+                    
+                    log "Удален старый инкрементный бэкап: $incr_basename"
+                    ((deleted_count++))
+                fi
+            done
+            
+            if [ "$deleted_count" -eq 0 ]; then
+                log "Старые инкрементные бэкапы не найдены"
+            else
+                log "Удалено инкрементных бэкапов: $deleted_count"
+            fi
+        else
+            log "Старый полный бэкап для удаления не найден"
         fi
     else
         log "ОШИБКА: Не удалось создать полный бэкап"
@@ -557,30 +632,13 @@ case $ACTION in
 
         ensure_directories
 
-        # Автоматическое определение типа бэкапа
-        if [ "$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep -c full)" -eq 0 ]; then
-            log "Первый бэкап - создание полного бэкапа"
+        # Выполняем указанный тип бэкапа
+        if [ "$BACKUP_TYPE" == "full" ]; then
+            log "Создание полного бэкапа"
             backup_full
-        else
-            # Проверяем когда был последний полный бэкап
-            last_full_backup=$(find "$BACKUP_DIR_DATA" -name "*_full.tar.gz" -type f | sort -r | head -1)
-            if [ -n "$last_full_backup" ]; then
-                # Простая логика: если прошло больше 7 дней с последнего полного бэкапа, делаем полный
-                last_full_date=$(stat -c %Y "$last_full_backup" 2>/dev/null)
-                current_date=$(date +%s)
-                days_diff=$(( (current_date - last_full_date) / 86400 ))
-
-                if [ "$days_diff" -ge 7 ]; then
-                    log "Прошло $days_diff дней с последнего полного бэкапа - создание полного бэкапа"
-                    backup_full
-                else
-                    log "Создание инкрементного бэкапа"
-                    backup_increment
-                fi
-            else
-                log "Создание полного бэкапа"
-                backup_full
-            fi
+        elif [ "$BACKUP_TYPE" == "incr" ]; then
+            log "Создание инкрементного бэкапа"
+            backup_increment
         fi
         ;;
 
