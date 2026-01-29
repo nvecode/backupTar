@@ -127,6 +127,36 @@ validate_restore_params() {
     return 0
 }
 
+# Функция проверки и очистки лишних инкрементных бэкапов
+check_and_clean_incr_backups() {
+    local incr_backups=$(find "$BACKUP_DIR_DATA" -maxdepth 1 -type f -name '*incr*.tar.gz' -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-)
+    local incr_count=$(echo "$incr_backups" | wc -l)
+    
+    if [ "$incr_count" -gt "$BACKUP_INCR_COUNT" ]; then
+        local to_delete=$((incr_count - BACKUP_INCR_COUNT))
+        log "Найдено $incr_count инкрементных бэкапов, нужно удалить $to_delete"
+        
+        local deleted=0
+        while read -r old_incr; do
+            if [ "$deleted" -lt "$to_delete" ] && [ -f "$old_incr" ]; then
+                local incr_basename=$(basename "$old_incr")
+                
+                rm -f "$old_incr"
+                log "Удален старый инкрементный бэкап (по лимиту): $incr_basename"
+                
+                # Удаляем лог
+                local incr_log="${BACKUP_DIR_DATA_LOG}/${incr_basename%.tar.gz}.log"
+                if [ -f "$incr_log" ]; then
+                    rm -f "$incr_log"
+                    log "Удален лог: $(basename "$incr_log")"
+                fi
+                
+                ((deleted++))
+            fi
+        done <<< "$incr_backups"
+    fi
+}
+
 # Функция получения списка backup_name
 get_backup_names() {
     local backup_dir=$1
@@ -255,6 +285,10 @@ backup_increment() {
                 rm -f "$old_file_log_backup_incr"
                 log "Удален старый лог: $(basename "$old_file_log_backup_incr")"
             fi
+            
+            # Проверяем и удаляем лишние инкрементные бэкапы по общему лимиту
+            check_and_clean_incr_backups
+            
         else
             log "ОШИБКА: Не удалось создать инкрементный бэкап"
             exit 1
@@ -280,66 +314,133 @@ backup_full() {
         # Даем время на запись файла
         sleep 2
 
-        # Находим и удаляем старый полный бэкап и все связанные с ним файлы
-        local old_full_backup=$(find "$BACKUP_DIR_DATA" -maxdepth 1 -type f -name '*full*' ! -name "${BACKUP_FILENAME}_full.tar.gz" | sort -n | head -n 1)
+        # Получаем список ВСЕХ полных бэкапов (включая новый) отсортированных по дате
+        local all_full_backups=$(find "$BACKUP_DIR_DATA" -maxdepth 1 -type f -name '*full*.tar.gz' -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-)
         
-        if [ -n "$old_full_backup" ] && [ -f "$old_full_backup" ]; then
-            # Получаем базовое имя старого полного бэкапа
-            local old_backup_basename=$(basename "$old_full_backup" .tar.gz)
-            local old_backup_date=$(echo "$old_backup_basename" | awk -F'_' '{print $2}')
+        # Считаем сколько полных бэкапов у нас есть
+        local full_count=$(echo "$all_full_backups" | wc -l)
+        
+        log "Текущее количество полных бэкапов: $full_count, лимит: $BACKUP_FULL_COUNT"
+        
+        # Если полных бэкапов больше чем нужно хранить
+        if [ "$full_count" -gt "$BACKUP_FULL_COUNT" ]; then
+            # Берем самый старый полный бэкап для удаления
+            local old_full_backup=$(echo "$all_full_backups" | head -1)
             
-            log "Найден старый полный бэкап: $(basename "$old_full_backup")"
-            
-            # 1. Удаляем старый полный бэкап
-            rm -f "$old_full_backup"
-            log "Удален старый полный бэкап: $(basename "$old_full_backup")"
-            
-            # 2. Удаляем лог старого полного бэкапа
-            local old_log="${BACKUP_DIR_DATA_LOG}/${old_backup_basename}.log"
-            if [ -f "$old_log" ]; then
-                rm -f "$old_log"
-                log "Удален старый лог: $(basename "$old_log")"
-            fi
-            
-            # 3. Удаляем snar файл старого полного бэкапа
-            local old_snar="${BACKUP_SNAR_DIR}/${old_backup_basename}.snar"
-            if [ -f "$old_snar" ]; then
-                rm -f "$old_snar"
-                log "Удален старый snar-файл: $(basename "$old_snar")"
-            fi
-            
-            # 4. Удаляем ВСЕ инкрементные бэкапы, созданные до нового полного бэкапа
-            log "Удаление старых инкрементных бэкапов..."
-            local deleted_count=0
-            for incr_file in "$BACKUP_DIR_DATA"/*incr*.tar.gz; do
-                [ -f "$incr_file" ] || continue
-                local incr_basename=$(basename "$incr_file")
-                local incr_date=$(echo "$incr_basename" | awk -F'_' '{print $2}')
+            if [ -n "$old_full_backup" ] && [ -f "$old_full_backup" ]; then
+                # Получаем информацию о старом бэкапе
+                local old_backup_basename=$(basename "$old_full_backup" .tar.gz)
+                local old_backup_date=$(echo "$old_backup_basename" | awk -F'_' '{print $2}')
+                local old_backup_time=$(echo "$old_backup_basename" | awk -F'_' '{print $3}')
                 
-                # Сравниваем даты (формат DDMMYYYY)
-                if [ "$incr_date" -lt "$BACKUP_DATE" ]; then
-                    rm -f "$incr_file"
-                    
-                    # Удаляем соответствующий лог
-                    local incr_log_file="${BACKUP_DIR_DATA_LOG}/${incr_basename%.tar.gz}.log"
-                    if [ -f "$incr_log_file" ]; then
-                        rm -f "$incr_log_file"
-                        log "Удален лог инкрементного бэкапа: $(basename "$incr_log_file")"
-                    fi
-                    
-                    log "Удален старый инкрементный бэкап: $incr_basename"
-                    ((deleted_count++))
+                log "Найден старый полный бэкап для удаления: $(basename "$old_full_backup")"
+                log "Дата старого бэкапа: $old_backup_date, время: $old_backup_time"
+                
+                # 1. Удаляем старый полный бэкап
+                rm -f "$old_full_backup"
+                log "Удален старый полный бэкап: $(basename "$old_full_backup")"
+                
+                # 2. Удаляем лог старого полного бэкапа
+                local old_log="${BACKUP_DIR_DATA_LOG}/${old_backup_basename}.log"
+                if [ -f "$old_log" ]; then
+                    rm -f "$old_log"
+                    log "Удален старый лог: $(basename "$old_log")"
                 fi
-            done
-            
-            if [ "$deleted_count" -eq 0 ]; then
-                log "Старые инкрементные бэкапы не найдены"
+                
+                # 3. Удаляем snar файл старого полного бэкапа
+                local old_snar="${BACKUP_SNAR_DIR}/${old_backup_basename}.snar"
+                if [ -f "$old_snar" ]; then
+                    rm -f "$old_snar"
+                    log "Удален старый snar-файл: $(basename "$old_snar")"
+                fi
+                
+                # 4. Удаляем ВСЕ инкрементные бэкапы, связанные с удаляемым полным бэкапом
+                log "Поиск инкрементных бэкапов для удаления..."
+                log "Удаляем инкрементные бэкапы, созданные до: $old_backup_date"
+                
+                local deleted_count=0
+                
+                # Находим следующий по старшинству полный бэкап (если есть)
+                local next_oldest_full=$(echo "$all_full_backups" | head -2 | tail -1)
+                if [ -n "$next_oldest_full" ]; then
+                    local next_oldest_date=$(basename "$next_oldest_full" | awk -F'_' '{print $2}')
+                    
+                    log "Следующий самый старый полный бэкап: $(basename "$next_oldest_full"), дата: $next_oldest_date"
+                    
+                    # Удаляем все инкрементные бэкапы, созданные между старым и следующим полным бэкапом
+                    # (те, которые относятся к удаляемому полному бэкапу)
+                    for incr_file in "$BACKUP_DIR_DATA"/*incr*.tar.gz; do
+                        [ -f "$incr_file" ] || continue
+                        local incr_basename=$(basename "$incr_file")
+                        local incr_date=$(echo "$incr_basename" | awk -F'_' '{print $2}')
+                        local incr_time=$(echo "$incr_basename" | awk -F'_' '{print $3}')
+                        
+                        # Логируем каждый найденный инкрементный файл для отладки
+                        log "Проверка инкрементного файла: $incr_basename, дата: $incr_date"
+                        
+                        # Удаляем инкрементные бэкапы, которые были созданы ДО даты следующего полного бэкапа
+                        # Это гарантирует, что мы удаляем только те инкременты, которые относятся к удаляемому полному бэкапу
+                        if [ "$incr_date" -lt "$next_oldest_date" ] || \
+                           ([ "$incr_date" -eq "$next_oldest_date" ] && [ -n "$incr_time" ] && [ "$incr_time" -lt "$(basename "$next_oldest_full" | awk -F'_' '{print $3}')" ]); then
+                            rm -f "$incr_file"
+                            
+                            # Удаляем соответствующий лог
+                            local incr_log_file="${BACKUP_DIR_DATA_LOG}/${incr_basename%.tar.gz}.log"
+                            if [ -f "$incr_log_file" ]; then
+                                rm -f "$incr_log_file"
+                                log "Удален лог инкрементного бэкапа: $(basename "$incr_log_file")"
+                            fi
+                            
+                            log "Удален инкрементный бэкап (относится к удаленному полному): $incr_basename"
+                            ((deleted_count++))
+                        fi
+                    done
+                else
+                    # Если остался только один полный бэкап (новый)
+                    log "Остался только новый полный бэкап, удаляем все старые инкрементные бэкапы"
+                    
+                    # Удаляем все инкрементные бэкапы, созданные до нового бэкапа
+                    for incr_file in "$BACKUP_DIR_DATA"/*incr*.tar.gz; do
+                        [ -f "$incr_file" ] || continue
+                        local incr_basename=$(basename "$incr_file")
+                        local incr_date=$(echo "$incr_basename" | awk -F'_' '{print $2}')
+                        local incr_time=$(echo "$incr_basename" | awk -F'_' '{print $3}')
+                        
+                        # Удаляем все инкременты, созданные до нового полного бэкапа
+                        if [ "$incr_date" -lt "$BACKUP_DATE" ] || \
+                           ([ "$incr_date" -eq "$BACKUP_DATE" ] && [ -n "$incr_time" ] && [ "$incr_time" -lt "$BACKUP_TIME" ]); then
+                            rm -f "$incr_file"
+                            
+                            # Удаляем соответствующий лог
+                            local incr_log_file="${BACKUP_DIR_DATA_LOG}/${incr_basename%.tar.gz}.log"
+                            if [ -f "$incr_log_file" ]; then
+                                rm -f "$incr_log_file"
+                                log "Удален лог инкрементного бэкапа: $(basename "$incr_log_file")"
+                            fi
+                            
+                            log "Удален старый инкрементный бэкап: $incr_basename"
+                            ((deleted_count++))
+                        fi
+                    done
+                fi
+                
+                if [ "$deleted_count" -eq 0 ]; then
+                    log "Инкрементные бэкапы для удаления не найдены"
+                else
+                    log "Удалено инкрементных бэкапов: $deleted_count"
+                fi
             else
-                log "Удалено инкрементных бэкапов: $deleted_count"
+                log "Старый полный бэкап для удаления не найден"
             fi
         else
-            log "Старый полный бэкап для удаления не найден"
+            log "Количество полных бэкапов в пределах лимита ($BACKUP_FULL_COUNT), удаление не требуется"
         fi
+        
+        # Также проверяем и удаляем лишние инкрементные бэкапы по общему лимиту
+        check_and_clean_incr_backups
+        
+        log "Всего файлов бэкапов после очистки:"
+        ls -la "$BACKUP_DIR_DATA"/*.tar.gz 2>/dev/null | wc -l
     else
         log "ОШИБКА: Не удалось создать полный бэкап"
         exit 1

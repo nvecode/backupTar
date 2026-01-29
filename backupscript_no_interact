@@ -1,65 +1,63 @@
 #!/bin/bash
 
-# SOURCE_BACKUP=/root/data
-# RESTORE_DIR=/restore
-# BACKUP_DIR_NAME=
-# BACKUP_NAME=mytestbackup
-# BACKUP_FULL_COUNT=2
-# BACKUP_INCR_COUNT=7
-OPTIONS=$2
-BACKUP_DIR=$3
-RESTORE_DIR=$4
-BACKUP_NAME=$4
-SOURCE_BACKUP=$5
-BACKUP_FULL_COUNT=$6
-BACKUP_INCR_COUNT=$7
+#BACKUP_VAR
+BACKUP_STORAGE_DIR=$2
+BACKUP_STORAGE_NAME=$3
+SOURCE_BACKUP=$4
+BACKUP_FULL_COUNT=$(( $5 * 2 ))
+BACKUP_INCR_COUNT=$(( $6 * 2 ))
 
-BACKUP_DIR_DATA=${BACKUP_DIR_NAME}/data
-BACKUP_DIR_DATA_LOG=${BACKUP_DIR_NAME}/logs
-BACKUP_SNAR_DIR=${BACKUP_DIR_NAME}/snar
+#RESTORE_VAR
+RESTORE_STORAGE_DIR=$3
+
+#=======================Неизменяемые поля=======================#
+BACKUP_DIR_DATA=${BACKUP_STORAGE_DIR}/data
+BACKUP_DIR_DATA_LOG=${BACKUP_STORAGE_DIR}/logs
+BACKUP_SNAR_DIR=${BACKUP_STORAGE_DIR}/snar
 BACKUP_DATE=$(date +'%d%m%Y')
-BACKUP_TIME=$(date +'%H%M')
-BACKUP_FILENAME=${BACKUP_NAME}_${BACKUP_DATE}_${BACKUP_TIME}
+BACKUP_TIME=$(date +'%H%M%S')
+BACKUP_FILENAME=${BACKUP_STORAGE_NAME}_${BACKUP_DATE}_${BACKUP_TIME}
 
-#Проверка директорий бэкап и логов
-dirsCheck=("$BACKUP_DIR_DATA" "$BACKUP_DIR_DATA_LOG" "$BACKUP_SNAR_DIR" "$RESTORE_DIR")
-for dir in ${dirsCheck[@]}; do
-    if [ ! -d "$dir" ]; then
-        mkdir $dir
-    fi
-done
+#Функция логирования
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
 
 #Функция вывода информации по скрипту
 show_help() {
     cat << EOF
 Использование:
-  ./backupscript backup <backup_dir> <backup_name> <source_dir> <full_count> <incr_count>
-  ./backupscript restore <restore_dir>
+  ./backupscript incr <backup_storage_dir> <backup_storage_name> <source_backup> <backup_full_count> <backup_incr_count>
+  ./backupscript full <backup_storage_dir> <backup_storage_name> <source_backup> <backup_full_count> <backup_incr_count>
+  ./backupscript restore <backup_storage_dir> <destination_restore_data>
 
 Параметры для резервного копирования:
-  backup_dir    - директория для хранения бэкапов
-  backup_name   - имя бэкапа
-  source_dir    - директория для резервного копирования
-  full_count    - количество хранимых полных бэкапов (целое число)
-  incr_count    - количество хранимых инкрементальных бэкапов (целое число)
+  backup_storage_dir    - директория для хранения бэкапов
+  backup_storage_name   - имя бэкапа
+  source_backup         - директория для резервного копирования
+  backup_full_count     - количество хранимых полных бэкапов (целое число)
+  backup_incr_count     - количество хранимых инкрементальных бэкапов (целое число)
 
 Параметры для восстановления:
-  backup_dir    - директория для хранения бэкапов
-  restore_dir   - директория для восстановления
+  backup_storage_dir        - директория для хранения бэкапов
+  destination_restore_data  - директория для восстановления
 
 Примеры:
-  ./backupscript backup /backups mybackup /home/user 3 5
+  ./backupscript incr /backups mybackup /home/user 3 5
+  ./backupscript full /backups mybackup /home/user 3 5
   ./backupscript restore /backups /restored_data
 EOF
 }
 
 #Функция поиска старых бэкапов или логов
 search_old_backup_or_log() {
+    #В функцию передаются: 1) Тип бэкапа: инкрементный или полный, 2) Тип файла: лог, бэкап или snar
     local typeBackup=$1
     local typeFile=$2
-    local file_count
-    local search_dir
+    local file_count=""
+    local search_dir=""
 
+    #Проверка на тип переданного файла и подсчёт количество файлов в директории
     if [ "$typeFile" == "backup" ]; then
         search_dir=$BACKUP_DIR_DATA
         file_count=$(ls $BACKUP_DIR_DATA | grep $typeBackup | wc -l)
@@ -71,15 +69,20 @@ search_old_backup_or_log() {
         file_count=$(ls $BACKUP_SNAR_DIR | grep $typeBackup | wc -l)
     fi
 
+    #Если количество файлов больше 0, то для полного бэкапа вывести все нужные файлы
     if [ -n "$file_count" ]; then
+        #Для FULL
         if [ "$typeBackup" == "full" ]; then
             if [ "$file_count" -gt $BACKUP_FULL_COUNT ]; then
                 find $search_dir -maxdepth 1 -type f -name '*full*' | sort -n | head -n 1
             fi
+        
+        #Для INCR
         elif [ "$typeBackup" == "incr" ]; then
             if [ "$file_count" -gt $BACKUP_INCR_COUNT ]; then
                 find $search_dir -maxdepth 1 -type f -name '*incr*' | sort -n | head -n 1
             fi
+        
         #Для SNAR
         elif [ "$typeBackup" == "full" ]; then
             if [ "$file_count" -gt $BACKUP_FULL_COUNT ]; then
@@ -89,26 +92,20 @@ search_old_backup_or_log() {
     fi
 }
 
-#Функция удаления инкрементных файлов
+#Функция удаления инкрементных файлов по времени модификации
 remove_old_file_incr_or_log() {
     local old_file_backup_or_log=$1
     local folder_old_file_backup_or_log=$2
-    local result_comparison_date=0
-    local result_comparison_time=0
 
-    #Удаляем инкременты бэкапов или логов, созданные до времени старого полного бэкапа или файла лога
-    old_file_backup_or_log_date=$(echo $old_file_backup_or_log | awk -F'_' '{print $2}')
-    old_file_backup_or_log_time=$(echo $old_file_backup_or_log | awk -F'_' '{print $3}')
-    old_file_backup_or_log_full_date="${old_file_backup_or_log_date}${old_file_backup_or_log_time}"
-
-    for old_file in $folder_old_file_backup_or_log/*incr*; do
-        [ -f "$old_file" ] || continue
-        old_file_date=$(echo $old_file | awk -F'_' '{print $2}')
-        old_file_time=$(echo $old_file | awk -F'_' '{print $3}')
-        old_file_time_full_date="${old_file_date}${old_file_time}"
-
-        if [ "$old_file_time_full_date" -lt "$old_file_backup_or_log_full_date" ]; then
-            rm -f "$old_file"
+    # Получаем время модификации старого файла (в секундах с эпохи)
+    old_file_mtime=$(stat -c %Y "$old_file_backup_or_log")
+    
+    # Удаляем инкрементные файлы, созданные раньше
+    find "$folder_old_file_backup_or_log" -name "*incr*" -type f | while read -r incr_file; do
+        file_mtime=$(stat -c %Y "$incr_file")
+        if [ "$file_mtime" -lt "$old_file_mtime" ]; then
+            echo "Удаляем: $(basename "$incr_file")"
+            rm -f "$incr_file"
         fi
     done
 }
@@ -143,7 +140,7 @@ backup_increment() {
 
 #Функция создания полных копий
 backup_full() {
-    BACKUP_SNAR="$BACKUP_SNAR_DIR/${BACKUP_NAME}_${BACKUP_DATE}_${BACKUP_TIME}_full.snar"
+    BACKUP_SNAR="$BACKUP_SNAR_DIR/${BACKUP_STORAGE_NAME}_${BACKUP_DATE}_${BACKUP_TIME}_full.snar"
     echo "$BACKUP_SNAR" > "$BACKUP_SNAR_DIR/last_backup.snar"
     
     #Выполнение полного бэкапа
@@ -172,7 +169,6 @@ backup_full() {
 
 #Функция восстановления файлов
 restore_data() {
-
     #Показать доступные бэкапы
     checkBackups=$(ls -1tr "$BACKUP_DIR_DATA" | grep -v log | grep -v snar)
 
@@ -232,11 +228,11 @@ restore_data() {
 
             if [[ -n "$checkFileInBackup" ]]; then
                 for file_in_backup in $checkFileInBackup; do
-                    tar -xf "$file_backup" -C "$RESTORE_DIR" "$file_in_backup"
+                    tar -xf "$file_backup" -C "$RESTORE_STORAGE_DIR" "$file_in_backup"
                 done
 
                 if [ $? -eq 0 ]; then
-                    echo "Данные восстановлены в папку $RESTORE_DIR"
+                    echo "Данные восстановлены в папку $RESTORE_STORAGE_DIR"
                     return 0
                 fi
             else
@@ -249,70 +245,70 @@ restore_data() {
             fi
     done
     
-    echo "Восстановление не выполнено"
+    log "Восстановление не выполнено"
 }
 
 case $1 in
-    "backup")
-        log "Режим: Резервное копирование"
+    "incr")
+        log "Режим: Создание инкрементной резервной копии"
 
-        # Проверка параметров
-        if ! validate_backup_params "$@"; then
-            log "ОШИБКА: Неверные параметры для резервного копирования"
-            show_help
-            exit 1
-        fi
+        log "Переданные параметры для выполнения инкрементного бэкапа:================="
+        log "Директория для сохранения бэкапа: $BACKUP_STORAGE_DIR"
+        log "Имя бэкапа: $BACKUP_STORAGE_NAME"
+        log "Файл или директория, которую необходимо бэкапировать: $SOURCE_BACKUP"
+        log "Количество точек для хранения полных бэкапов: $BACKUP_FULL_COUNT"
+        log "Количество точек для хранения инкрементных бэкапов: $BACKUP_INCR_COUNT"
 
-        ensure_directories
-
-        # Автоматическое определение типа бэкапа
-        if [ "$(ls "$BACKUP_DIR_DATA" 2>/dev/null | grep -c full)" -eq 0 ]; then
-            log "Первый бэкап - создание полного бэкапа"
-            backup_full
-        else
-            # Проверяем когда был последний полный бэкап
-            last_full_backup=$(find "$BACKUP_DIR_DATA" -name "*_full.tar.gz" -type f | sort -r | head -1)
-            if [ -n "$last_full_backup" ]; then
-                # Простая логика: если прошло больше 7 дней с последнего полного бэкапа, делаем полный
-                last_full_date=$(stat -c %Y "$last_full_backup")
-                current_date=$(date +%s)
-                days_diff=$(( (current_date - last_full_date) / 86400 ))
-
-                if [ "$days_diff" -ge 7 ]; then
-                    log "Прошло $days_diff дней с последнего полного бэкапа - создание полного бэкапа"
-                    backup_full
-                else
-                    log "Создание инкрементного бэкапа"
-                    backup_increment
-                fi
-            else
-                log "Создание полного бэкапа"
-                backup_full
+        #Создание директории бэкопирования если не существует
+        dirsCheck=("$BACKUP_DIR_DATA" "$BACKUP_DIR_DATA_LOG" "$BACKUP_SNAR_DIR")
+        for dir in ${dirsCheck[@]}; do
+            if [ ! -d "$dir" ]; then
+                mkdir -p $dir
             fi
-        fi
+        done
+
+        backup_increment
         ;;
+    
+    "full")
+        log "Режим: Создание полной резервной копии"
 
+        log "Переданные параметры для выполнения полного бэкапа:================="
+        log "Директория для сохранения бэкапа: $BACKUP_STORAGE_DIR"
+        log "Имя бэкапа: $BACKUP_STORAGE_NAME"
+        log "Файл или директория, которую необходимо бэкапировать: $SOURCE_BACKUP"
+        log "Количество точек для хранения полных бэкапов: $BACKUP_FULL_COUNT"
+        log "Количество точек для хранения инкрементных бэкапов: $BACKUP_INCR_COUNT"
+
+        #Создание директории бэкопирования если не существует
+        dirsCheck=("$BACKUP_DIR_DATA" "$BACKUP_DIR_DATA_LOG" "$BACKUP_SNAR_DIR")
+        for dir in ${dirsCheck[@]}; do
+            if [ ! -d "$dir" ]; then
+                mkdir -p $dir
+            fi
+        done
+
+        backup_full
+        ;;
+    
     "restore")
-        log "Режим: Восстановление"
+        log "Режим: Восстановление данных"
 
-        # Проверка параметров
-        if ! validate_restore_params "$BACKUP_DIR" "$RESTORE_DIR"; then
-            log "ОШИБКА: Неверные параметры для восстановления"
-            show_help
-            exit 1
+        log "Переданные параметры для выполнения восстановления:================="
+        log "Директория хранения бэкапов: $BACKUP_STORAGE_DIR"
+        log "Директория, в которую будут сохранены восстановленные файлы: $RESTORE_STORAGE_DIR"
+
+        #Создание директории восстановления если не существует
+        if [ ! -d "$RESTORE_STORAGE_DIR" ]; then
+            mkdir -p "$RESTORE_STORAGE_DIR"
+            log "Создана директория восстановления: $RESTORE_STORAGE_DIR"
         fi
 
-        # Создание директории восстановления если не существует
-        if [ ! -d "$RESTORE_DIR" ]; then
-            mkdir -p "$RESTORE_DIR"
-            log "Создана директория восстановления: $RESTORE_DIR"
-        fi
-
-        restore_data "$BACKUP_DIR" "$RESTORE_DIR"
+        restore_data "$BACKUP_STORAGE_DIR" "$RESTORE_STORAGE_DIR"
         ;;
 
     *)
-        log "ОШИБКА: Неизвестная команда '$1'"
+        log "Инструкция по использованию. Вызовите скрипт с нужными ключами..."
         show_help
         exit 1
         ;;
