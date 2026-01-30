@@ -346,6 +346,12 @@ case $1 in
         done
 
         backup_increment
+
+        if [ $? -eq 0 ]; then
+            log "Инкрементный бэкап успешно создан"
+        else
+            log "Произошла ошибка при создании инкреметного бэкапа"
+        fi
         ;;
     
     "full")
@@ -367,6 +373,12 @@ case $1 in
         done
 
         backup_full
+
+        if [ $? -eq 0 ]; then
+            log "Полный бэкап успешно создан"
+        else
+            log "Произошла ошибка при создании полного бэкапа"
+        fi
         ;;
     
     "restore")
