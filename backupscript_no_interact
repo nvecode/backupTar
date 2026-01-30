@@ -1,13 +1,26 @@
 #!/bin/bash
 
-#BACKUP_VAR
+#Переменные для бэкапа
 BACKUP_STORAGE_DIR=$2
 BACKUP_STORAGE_NAME=$3
 SOURCE_BACKUP=$4
-BACKUP_FULL_COUNT=$(( $5 * 2 ))
-BACKUP_INCR_COUNT=$(( $6 * 2 ))
+BACKUP_FULL_COUNT_POLICY=$5
+BACKUP_INCR_COUNT_POLICY=$6
 
-#RESTORE_VAR
+BACKUP_FULL_COUNT_POLICY=${BACKUP_FULL_COUNT_POLICY:-0}
+BACKUP_INCR_COUNT_POLICY=${BACKUP_INCR_COUNT_POLICY:-0}
+
+if [[ $BACKUP_FULL_COUNT_POLICY == 0 || $BACKUP_INCR_COUNT_POLICY == 0 ]]; then
+    COUNT_RATION_INCR_FULL=0
+else
+    COUNT_RATION_INCR_FULL=$(( (BACKUP_INCR_COUNT_POLICY + BACKUP_FULL_COUNT_POLICY - 1) / BACKUP_FULL_COUNT_POLICY ))
+fi
+
+#Вычисление итого количество точек для полных и инкрементных копий
+BACKUP_FULL_COUNT=$(( $BACKUP_FULL_COUNT_POLICY + 1 ))
+BACKUP_INCR_COUNT=$(( $BACKUP_INCR_COUNT_POLICY + $COUNT_RATION_INCR_FULL ))
+
+#Переменные для восстановления
 RESTORE_STORAGE_DIR=$3
 
 #=======================Неизменяемые поля=======================#
@@ -30,6 +43,7 @@ show_help() {
   ./backupscript incr <backup_storage_dir> <backup_storage_name> <source_backup> <backup_full_count> <backup_incr_count>
   ./backupscript full <backup_storage_dir> <backup_storage_name> <source_backup> <backup_full_count> <backup_incr_count>
   ./backupscript restore <backup_storage_dir> <destination_restore_data>
+  ./backupscript show_files_in_backup <backup_storage_dir>
 
 Параметры для резервного копирования:
   backup_storage_dir    - директория для хранения бэкапов
@@ -46,6 +60,7 @@ show_help() {
   ./backupscript incr /backups mybackup /home/user 3 5
   ./backupscript full /backups mybackup /home/user 3 5
   ./backupscript restore /backups /restored_data
+  ./backupscript show_files_in_backup <backup_storage_dir>
 EOF
 }
 
@@ -110,6 +125,69 @@ remove_old_file_incr_or_log() {
     done
 }
 
+#Просмотр файлов бэкапов в директории
+show_dir_backup() {
+    log "Просмотр файлов бэкапов в директории"
+
+    checkBackups=$(ls -1tr "$BACKUP_DIR_DATA" | grep -v log | grep -v snar)
+
+    if [ -n "$checkBackups" ]; then
+        i=1
+        for backup in $checkBackups; do
+            echo "$i) $backup"
+            ((i++)) 2>/dev/null || i=$((i+1))
+        done
+    fi
+}
+
+#Просмотр файлов внутри бэкапа
+show_files_in_backup() {
+    #Вызываем функцию просмотра файлов бэкапов в директории
+    show_dir_backup
+
+    if [ $? -eq 0 ]; then
+        read -p "Введите дату (в формате 10112025): " data_backup
+    else
+        log "Нет доступных бэкапов"
+        exit 1
+    fi
+
+    #Проверка наличия бэкапа по дате
+    if [[ -z $(ls $BACKUP_DIR_DATA | grep "$data_backup") ]]; then
+        log "Не найдено бэкапа за эту дату"
+        exit 1
+    fi
+
+    # Запрос на просмотр содержимого архива
+    read -p "Хотите просмотреть содержимое архива? (y/n): " view_content
+    
+    if [[ "$view_content" == "y" || "$view_content" == "Y" ]]; then
+        # Создание массива из файлов бэкапов за указанную дату
+        mapfile -t date_files < <(find $BACKUP_DIR_DATA -maxdepth 1 -type f -name "*${data_backup}*" | sort)
+        
+        if [ ${#date_files[@]} -eq 0 ]; then
+            log "Нет файлов бэкапа за указанную дату"
+            exit 1
+        fi
+        
+        log "Доступные архивы за дату $data_backup:"
+        for i in "${!date_files[@]}"; do
+            echo "$((i+1))) $(basename "${date_files[$i]}")"
+        done
+        
+        read -p "Выберите номер архива для просмотра (1-${#date_files[@]}): " archive_num
+        
+        if [[ "$archive_num" =~ ^[0-9]+$ ]] && [ "$archive_num" -ge 1 ] && [ "$archive_num" -le ${#date_files[@]} ]; then
+            selected_archive="${date_files[$((archive_num-1))]}"
+            log "Содержимое архива $(basename "$selected_archive"):"
+            log "----------------------------------------"
+            tar -tzf "$selected_archive"
+        else
+            log "Неверный номер архива"
+        fi
+    fi
+}
+
 #Функция создания инкрементных копий
 backup_increment() {
     if [[ "$(ls $BACKUP_DIR_DATA | grep full | wc -l)" > 0 ]]; then
@@ -117,23 +195,24 @@ backup_increment() {
         if [ -f "$BACKUP_SNAR_DIR/last_backup.snar" ]; then
             BACKUP_SNAR=$(cat "$BACKUP_SNAR_DIR/last_backup.snar")
         else
-            echo "Файл SNAR для последнего запущенного полного бэкапа не найден"
+            log "Файл SNAR для последнего запущенного полного бэкапа не найден"
             exit 1
         fi
         
         #Выполнение инкрементного бэкапа
         tar -g $BACKUP_SNAR -czvf $BACKUP_DIR_DATA/${BACKUP_FILENAME}_incr.tar.gz -C $SOURCE_BACKUP . &>$BACKUP_DIR_DATA_LOG/${BACKUP_FILENAME}_incr.log
         if [ $? -eq 0 ]; then
-            #Находим бэкап или файлы, старше нужных POINT
+            
+            #Находим бэкап или файлы, старше нужных POINT - ДЛЯ ИНКРЕМЕНТНЫХ КОПИЙ
             old_file_backup_incr=$(search_old_backup_or_log incr backup)
             old_file_log_backup_incr=$(search_old_backup_or_log incr log)
 
-            #Удаляем найденные файлы бэкап или логов
+            #Удаляем найденные файлы бэкап или логов - ДЛЯ ИНКРЕМЕНТНЫХ КОПИЙ
             rm -f $old_file_backup_incr
             rm -f $old_file_log_backup_incr
         fi
     else
-        echo "Необходимо сначала выполнить полный бэкап"
+        log "Необходимо сначала выполнить полный бэкап"
         exit 1
     fi
 }
@@ -146,17 +225,18 @@ backup_full() {
     #Выполнение полного бэкапа
     tar -g $BACKUP_SNAR -czvf $BACKUP_DIR_DATA/${BACKUP_FILENAME}_full.tar.gz -C $SOURCE_BACKUP . &>$BACKUP_DIR_DATA_LOG/${BACKUP_FILENAME}_full.log
     if [ $? -eq 0 ]; then
-        #Находим бэкап или файлы, старше нужных POINT
+
+        #Находим бэкап или файлы, старше нужных POINT - ДЛЯ ПОЛНЫХ КОПИЙ
         old_file_backup_full=$(search_old_backup_or_log full backup)
         old_file_log_backup_full=$(search_old_backup_or_log full log)
         old_file_snar_backup_full=$(search_old_backup_or_log full snar)
 
-        #Удаляем найденные файлы бэкап или логов
+        #Удаляем найденные файлы бэкап или логов - ДЛЯ ПОЛНЫХ КОПИЙ
         rm -f $old_file_backup_full
         rm -f $old_file_log_backup_full
         rm -f $old_file_snar_backup_full
 
-        #Проверка наличия двух полных бэкапов и удаление всех инкрементов не актуальных для этих полных бэкапов
+        #Проверка наличия полных бэкапов и удаление всех инкрементов не актуальных для этих полных бэкапов
         count_full_backup=$(ls $BACKUP_DIR_DATA | grep full | wc -l)
         if [[ $count_full_backup == $BACKUP_FULL_COUNT ]]; then
             old_file_backup_full=$(find $BACKUP_DIR_DATA -maxdepth 1 -type f -name '*full*' | sort -n | head -n 1)
@@ -169,28 +249,10 @@ backup_full() {
 
 #Функция восстановления файлов
 restore_data() {
-    #Показать доступные бэкапы
-    checkBackups=$(ls -1tr "$BACKUP_DIR_DATA" | grep -v log | grep -v snar)
+    #Вызываем функцию просмотра файлов в резервной копии
+    show_files_in_backup
 
-    if [ -n "$checkBackups" ]; then
-        i=1
-        for backup in $checkBackups; do
-            echo "$i) $backup"
-            ((i++)) 2>/dev/null || i=$((i+1))  # Защита от ошибок
-        done
-
-        read -p "Введите дату восстановления (в формате 10112025): " restoreDate
-        read -p "Введите название файла или его часть для поиска: " restoreData
-    else
-        echo "Нет доступных бэкапов"
-        exit 1
-    fi
-
-    #Проверка наличия бэкапа по дате
-    if [[ -z $(ls $BACKUP_DIR_DATA | grep "$restoreDate") ]]; then
-        echo "Не найдено бэкапа за эту дату"
-        exit 1
-    fi
+    read -p "Введите название файла или его часть для поиска и последующего восстановления: " restoreData
 
     #Создание массива из файлов бэкапов для его индексации
     mapfile -t files_sorted < <(
@@ -207,7 +269,7 @@ restore_data() {
     #Поиск индекса бэкапа соответствующего дате поиска
     for i in "${!files_sorted[@]}"; do
             file_date=$(echo "${files_sorted[$i]}" | awk -F' ' '{print $1}')
-            if [[ "$file_date" == "$restoreDate" ]]; then
+            if [[ "$file_date" == "$data_backup" ]]; then
                     start_index=$i
                     break
             fi
@@ -215,7 +277,7 @@ restore_data() {
 
     #Проверка что start_index был найден
     if [[ -z "$start_index" ]]; then
-        echo "Не удалось найти начальный индекс для восстановления"
+        log "Не удалось найти начальный индекс для восстановления"
         exit 1
     fi
 
@@ -223,20 +285,35 @@ restore_data() {
     for ((i=start_index; i<${#files_sorted[@]}; i++)); do
             file_backup=$(echo "${files_sorted[$i]}" | awk -F' ' '{print $2}')
             
-            #Процедура поиска файла внутри архивов
-            checkFileInBackup=$(tar -tf "$file_backup" | grep -wi "$restoreData")
+            # Проверяем существование архива
+            if [ ! -f "$file_backup" ]; then
+                log "Архив $file_backup не найден"
+                return 1
+            fi
+            
+            # Ищем файлы по шаблону в архиве
+            tar -tzf "$file_backup" 2>/dev/null | grep -i "$search_pattern"
+            if [ $? -ne 0 ]; then
+                return 1
+            fi
 
-            if [[ -n "$checkFileInBackup" ]]; then
+            if [ $? -eq 0 ]; then
+                #Если нашли файл, извлекаем его
+                checkFileInBackup=$(tar -tzf "$file_backup" | grep -wi "$restoreData")
+                
                 for file_in_backup in $checkFileInBackup; do
-                    tar -xf "$file_backup" -C "$RESTORE_STORAGE_DIR" "$file_in_backup"
+                    tar -xzf "$file_backup" -C "$RESTORE_STORAGE_DIR" "$file_in_backup"
+                    if [ $? -eq 0 ]; then
+                        log "Файл $file_in_backup восстановлен в папку $RESTORE_STORAGE_DIR"
+                    else
+                        log "Ошибка при восстановлении файла $file_in_backup"
+                    fi
                 done
-
-                if [ $? -eq 0 ]; then
-                    echo "Данные восстановлены в папку $RESTORE_STORAGE_DIR"
-                    return 0
-                fi
+                
+                log "Восстановление завершено"
+                return 0
             else
-                echo "Данные для восстановления не найдены в $file_backup"
+                log "Данные для восстановления не найдены в $(basename "$file_backup")"
             fi
 
             #Проверка нахождения первого full
@@ -245,7 +322,8 @@ restore_data() {
             fi
     done
     
-    log "Восстановление не выполнено"
+    log "Восстановление не выполнено - файлы не найдены"
+    return 1
 }
 
 case $1 in
@@ -306,7 +384,15 @@ case $1 in
 
         restore_data "$BACKUP_STORAGE_DIR" "$RESTORE_STORAGE_DIR"
         ;;
+    
+    "show_files_in_backup")
+        log "Режим: Просмотр файлов внутри бэкапа"
 
+        log "Переданные параметры для выполнения восстановления:================="
+        log "Директория хранения бэкапов: $BACKUP_STORAGE_DIR"
+    
+        show_files_in_backup
+        ;;
     *)
         log "Инструкция по использованию. Вызовите скрипт с нужными ключами..."
         show_help
