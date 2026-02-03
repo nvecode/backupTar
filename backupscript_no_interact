@@ -348,9 +348,9 @@ case $1 in
         backup_increment
 
         if [ $? -eq 0 ]; then
-            log "SUCCESS: Инкрементный бэкап успешно создан"
+            log "SUCCESS: Инкрементный бэкап данных $SOURCE_BACKUP успешно создан"
         else
-            log "ERROR: Произошла ошибка при создании инкреметного бэкапа"
+            log "ERROR: Произошла ошибка при создании инкреметного бэкапа данных $SOURCE_BACKUP"
         fi
         ;;
     
@@ -375,9 +375,9 @@ case $1 in
         backup_full
 
         if [ $? -eq 0 ]; then
-            log "SUCCESS: Полный бэкап успешно создан"
+            log "SUCCESS: Полный бэкап данных $SOURCE_BACKUP успешно создан"
         else
-            log "ERROR: Произошла ошибка при создании полного бэкапа"
+            log "ERROR: Произошла ошибка при создании полного бэкапа данных $SOURCE_BACKUP"
         fi
         ;;
     
